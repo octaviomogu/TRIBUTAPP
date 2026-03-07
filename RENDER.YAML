@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: tributapp
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn -w 2 -b 0.0.0.0:$PORT tributapp_app:app
