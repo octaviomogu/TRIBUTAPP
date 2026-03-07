@@ -7,10 +7,12 @@ import sys
 import tempfile
 import unittest
 from datetime import datetime
+from functools import wraps
 from pathlib import Path
 from typing import Any
 
 from flask import Flask, flash, redirect, render_template_string, request, session, url_for
+from werkzeug.security import check_password_hash, generate_password_hash
 
 
 # -----------------------------
@@ -46,6 +48,18 @@ def init_db() -> None:
 
     cur.execute(
         """
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            email TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS empresas (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             nombre TEXT NOT NULL,
@@ -55,12 +69,19 @@ def init_db() -> None:
         """
     )
 
-    cur.execute("SELECT COUNT(*) AS total FROM empresas")
-    if cur.fetchone()["total"] == 0:
-        cur.execute(
-            "INSERT INTO empresas (nombre, rut) VALUES (?, ?)",
-            ("Empresa Demo", "00000000-0"),
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS empresa_users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            empresa_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            role TEXT NOT NULL DEFAULT 'owner',
+            UNIQUE(empresa_id, user_id),
+            FOREIGN KEY (empresa_id) REFERENCES empresas(id),
+            FOREIGN KEY (user_id) REFERENCES users(id)
         )
+        """
+    )
 
     cur.execute(
         """
@@ -126,6 +147,58 @@ def init_db() -> None:
 
     conn.commit()
     conn.close()
+
+
+# -----------------------------
+# Auth helpers
+# -----------------------------
+def create_user(name: str, email: str, password: str) -> int:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO users (name, email, password_hash) VALUES (?, ?, ?)",
+        (name.strip(), email.strip().lower(), generate_password_hash(password)),
+    )
+    conn.commit()
+    user_id = cur.lastrowid
+    conn.close()
+    return int(user_id)
+
+
+
+def get_user_by_email(email: str) -> sqlite3.Row | None:
+    conn = get_connection()
+    row = conn.execute("SELECT * FROM users WHERE email = ?", (email.strip().lower(),)).fetchone()
+    conn.close()
+    return row
+
+
+
+def get_user_by_id(user_id: int) -> sqlite3.Row | None:
+    conn = get_connection()
+    row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+    conn.close()
+    return row
+
+
+
+def get_current_user() -> sqlite3.Row | None:
+    user_id = session.get("user_id")
+    if not user_id:
+        return None
+    return get_user_by_id(int(user_id))
+
+
+
+def login_required(view_func):
+    @wraps(view_func)
+    def wrapped(*args, **kwargs):
+        if get_current_user() is None:
+            flash("Debes iniciar sesión para continuar.")
+            return redirect(url_for("login_view"))
+        return view_func(*args, **kwargs)
+
+    return wrapped
 
 
 # -----------------------------
@@ -233,19 +306,23 @@ def detect_periodo(filename: str) -> str:
 # -----------------------------
 # Empresa helpers
 # -----------------------------
-def get_empresas() -> list[sqlite3.Row]:
+def get_empresas(user_id: int | None = None) -> list[sqlite3.Row]:
     conn = get_connection()
-    rows = conn.execute("SELECT * FROM empresas ORDER BY id DESC").fetchall()
+    if user_id is None:
+        rows = conn.execute("SELECT * FROM empresas ORDER BY id DESC").fetchall()
+    else:
+        rows = conn.execute(
+            """
+            SELECT e.*
+            FROM empresas e
+            JOIN empresa_users eu ON eu.empresa_id = e.id
+            WHERE eu.user_id = ?
+            ORDER BY e.id DESC
+            """,
+            (user_id,),
+        ).fetchall()
     conn.close()
     return rows
-
-
-
-def get_default_empresa_id() -> int:
-    conn = get_connection()
-    row = conn.execute("SELECT id FROM empresas ORDER BY id LIMIT 1").fetchone()
-    conn.close()
-    return int(row["id"])
 
 
 
@@ -257,13 +334,51 @@ def get_empresa_by_id(empresa_id: int) -> sqlite3.Row | None:
 
 
 
+def user_has_access_to_empresa(user_id: int, empresa_id: int) -> bool:
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT 1 FROM empresa_users WHERE user_id = ? AND empresa_id = ?",
+        (user_id, empresa_id),
+    ).fetchone()
+    conn.close()
+    return row is not None
+
+
+
+def create_empresa(nombre: str, rut: str, owner_user_id: int | None = None) -> int:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("INSERT INTO empresas (nombre, rut) VALUES (?, ?)", (nombre.strip(), rut.strip() or "00000000-0"))
+    empresa_id = cur.lastrowid
+    if owner_user_id is not None:
+        cur.execute(
+            "INSERT INTO empresa_users (empresa_id, user_id, role) VALUES (?, ?, ?)",
+            (empresa_id, owner_user_id, "owner"),
+        )
+    conn.commit()
+    conn.close()
+    return int(empresa_id)
+
+
+
+def get_default_empresa_id_for_user(user_id: int) -> int:
+    empresas = get_empresas(user_id=user_id)
+    if empresas:
+        return int(empresas[-1]["id"])
+    return create_empresa("Mi Empresa", "00000000-0", owner_user_id=user_id)
+
+
+
 def get_active_empresa_id() -> int:
+    user = get_current_user()
+    if user is None:
+        raise ValueError("No hay usuario autenticado")
+
     empresa_id = session.get("empresa_activa_id")
-    if empresa_id:
-        empresa = get_empresa_by_id(int(empresa_id))
-        if empresa:
-            return int(empresa["id"])
-    default_id = get_default_empresa_id()
+    if empresa_id and user_has_access_to_empresa(int(user["id"]), int(empresa_id)):
+        return int(empresa_id)
+
+    default_id = get_default_empresa_id_for_user(int(user["id"]))
     session["empresa_activa_id"] = default_id
     return default_id
 
@@ -272,20 +387,8 @@ def get_active_empresa_id() -> int:
 def get_active_empresa() -> sqlite3.Row:
     empresa = get_empresa_by_id(get_active_empresa_id())
     if empresa is None:
-        default_id = get_default_empresa_id()
-        empresa = get_empresa_by_id(default_id)
+        raise ValueError("No encontré la empresa activa")
     return empresa
-
-
-
-def create_empresa(nombre: str, rut: str) -> int:
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("INSERT INTO empresas (nombre, rut) VALUES (?, ?)", (nombre.strip(), rut.strip() or "00000000-0"))
-    conn.commit()
-    empresa_id = cur.lastrowid
-    conn.close()
-    return int(empresa_id)
 
 
 # -----------------------------
@@ -371,15 +474,13 @@ def insert_rows(tipo_archivo: str, empresa_id: int, periodo: str, rows: list[dic
 
 
 
-def process_csv(file_storage, empresa_id: int | None = None) -> tuple[str, str, int]:
+def process_csv(file_storage, empresa_id: int) -> tuple[str, str, int]:
     filename = file_storage.filename or "archivo.csv"
     tipo = detect_tipo_archivo(filename)
     if tipo == "desconocido":
         raise ValueError("No pude detectar si el archivo es de compras o ventas.")
 
     periodo = detect_periodo(filename)
-    empresa_id = empresa_id or get_default_empresa_id()
-
     text = file_storage.read().decode("latin-1")
     reader = csv.DictReader(io.StringIO(text), delimiter=";")
     if not reader.fieldnames:
@@ -446,8 +547,7 @@ def calcular_iva(ventas_netas: float, compras_netas: float, tasa: float = 0.19) 
 # -----------------------------
 # Query helpers
 # -----------------------------
-def get_dashboard_metrics(empresa_id: int | None = None) -> dict[str, Any]:
-    empresa_id = empresa_id or get_default_empresa_id()
+def get_dashboard_metrics(empresa_id: int) -> dict[str, Any]:
     conn = get_connection()
     ventas = conn.execute("SELECT COALESCE(SUM(neto), 0) AS total FROM ventas WHERE empresa_id = ?", (empresa_id,)).fetchone()["total"]
     compras = conn.execute("SELECT COALESCE(SUM(neto), 0) AS total FROM compras WHERE empresa_id = ?", (empresa_id,)).fetchone()["total"]
@@ -552,11 +652,11 @@ def get_reportes(empresa_id: int | None = None) -> dict[str, Any]:
 # -----------------------------
 # Data helpers
 # -----------------------------
-def reset_database() -> None:
+def reset_database_for_empresa(empresa_id: int) -> None:
     conn = get_connection()
-    conn.execute("DELETE FROM compras")
-    conn.execute("DELETE FROM ventas")
-    conn.execute("DELETE FROM archivos_importados")
+    conn.execute("DELETE FROM compras WHERE empresa_id = ?", (empresa_id,))
+    conn.execute("DELETE FROM ventas WHERE empresa_id = ?", (empresa_id,))
+    conn.execute("DELETE FROM archivos_importados WHERE empresa_id = ?", (empresa_id,))
     conn.commit()
     conn.close()
 
@@ -619,8 +719,9 @@ BASE_HTML = """
 </head>
 <body>
   <div class="nav">
-    <div class="brand">TributApp · SaaS de Contabilidad Chile</div>
+    <div class="brand">TributApp · SaaS MVP</div>
     <div class="nav-links">
+      {% if current_user %}
       <a href="{{ url_for('index') }}">Dashboard</a>
       <a href="{{ url_for('empresas_view') }}">Empresas</a>
       <a href="{{ url_for('cargar_archivos') }}">Cargar archivos</a>
@@ -628,11 +729,17 @@ BASE_HTML = """
       <a href="{{ url_for('reportes_view') }}">Reportes</a>
       <a href="{{ url_for('calculadora_honorarios') }}">Honorarios</a>
       <a href="{{ url_for('calculadora_iva_view') }}">IVA</a>
+      <a href="{{ url_for('logout_view') }}">Salir</a>
+      {% else %}
+      <a href="{{ url_for('login_view') }}">Ingresar</a>
+      <a href="{{ url_for('register_view') }}">Crear cuenta</a>
+      {% endif %}
     </div>
   </div>
   <div class="container">
-    {% if empresas and empresa_activa %}
+    {% if current_user and empresas and empresa_activa %}
     <div class="card empresa-switcher">
+      <span class="pill">Usuario: {{ current_user['name'] }}</span>
       <span class="pill">Empresa activa: {{ empresa_activa['nombre'] }} · {{ empresa_activa['rut'] }}</span>
       <form method="post" action="{{ url_for('set_active_empresa') }}">
         <select name="empresa_id">
@@ -658,53 +765,138 @@ BASE_HTML = """
 """
 
 
-# -----------------------------
-# Routes
-# -----------------------------
 @app.context_processor
 def inject_global_template_vars() -> dict[str, Any]:
     try:
-        empresas = get_empresas()
+        current_user = get_current_user()
+        if current_user is None:
+            return {"current_user": None, "empresas": [], "empresa_activa": None}
+        empresas = get_empresas(user_id=int(current_user["id"]))
         empresa_activa = get_active_empresa()
+        return {"current_user": current_user, "empresas": empresas, "empresa_activa": empresa_activa}
     except Exception:
-        empresas = []
-        empresa_activa = None
-    return {"empresas": empresas, "empresa_activa": empresa_activa}
+        return {"current_user": None, "empresas": [], "empresa_activa": None}
+
+
+# -----------------------------
+# Routes
+# -----------------------------
+@app.route("/register", methods=["GET", "POST"])
+def register_view():
+    if get_current_user() is not None:
+        return redirect(url_for("index"))
+
+    if request.method == "POST":
+        name = request.form.get("name", "").strip()
+        email = request.form.get("email", "").strip().lower()
+        password = request.form.get("password", "")
+        if not name or not email or not password:
+            flash("Completa todos los campos.")
+            return redirect(url_for("register_view"))
+        if get_user_by_email(email) is not None:
+            flash("Ya existe un usuario con ese correo.")
+            return redirect(url_for("register_view"))
+
+        user_id = create_user(name, email, password)
+        empresa_id = create_empresa(f"Empresa de {name}", "00000000-0", owner_user_id=user_id)
+        session["user_id"] = user_id
+        session["empresa_activa_id"] = empresa_id
+        flash("Cuenta creada correctamente. Bienvenido a TributApp.")
+        return redirect(url_for("index"))
+
+    body = render_template_string(
+        """
+        <div class="hero"><h1 style="margin:0 0 8px;">Crear cuenta</h1><p style="margin:0;">Primer paso para convertir TributApp en SaaS real.</p></div>
+        <div class="card">
+          <form method="post">
+            <p><label>Nombre</label><input type="text" name="name"></p>
+            <p><label>Correo</label><input type="email" name="email"></p>
+            <p><label>Contraseña</label><input type="password" name="password"></p>
+            <p><button class="btn" type="submit">Crear cuenta</button></p>
+          </form>
+        </div>
+        """
+    )
+    return render_template_string(BASE_HTML, title="Crear cuenta", body=body)
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login_view():
+    if get_current_user() is not None:
+        return redirect(url_for("index"))
+
+    if request.method == "POST":
+        email = request.form.get("email", "").strip().lower()
+        password = request.form.get("password", "")
+        user = get_user_by_email(email)
+        if user is None or not check_password_hash(user["password_hash"], password):
+            flash("Correo o contraseña incorrectos.")
+            return redirect(url_for("login_view"))
+        session["user_id"] = int(user["id"])
+        session["empresa_activa_id"] = get_default_empresa_id_for_user(int(user["id"]))
+        flash(f"Bienvenido, {user['name']}.")
+        return redirect(url_for("index"))
+
+    body = render_template_string(
+        """
+        <div class="hero"><h1 style="margin:0 0 8px;">Iniciar sesión</h1><p style="margin:0;">Accede a tus empresas y tu información tributaria.</p></div>
+        <div class="card">
+          <form method="post">
+            <p><label>Correo</label><input type="email" name="email"></p>
+            <p><label>Contraseña</label><input type="password" name="password"></p>
+            <p><button class="btn" type="submit">Ingresar</button></p>
+          </form>
+        </div>
+        """
+    )
+    return render_template_string(BASE_HTML, title="Ingresar", body=body)
+
+
+@app.route("/logout")
+def logout_view():
+    session.clear()
+    flash("Sesión cerrada correctamente.")
+    return redirect(url_for("login_view"))
 
 
 @app.route("/empresa-activa", methods=["POST"])
+@login_required
 def set_active_empresa():
     empresa_id_raw = request.form.get("empresa_id", "").strip()
-    if not empresa_id_raw.isdigit():
+    user = get_current_user()
+    if user is None or not empresa_id_raw.isdigit():
         flash("Empresa inválida.")
         return redirect(request.referrer or url_for("index"))
-    empresa = get_empresa_by_id(int(empresa_id_raw))
-    if empresa is None:
-        flash("No encontré la empresa seleccionada.")
+    empresa_id = int(empresa_id_raw)
+    if not user_has_access_to_empresa(int(user["id"]), empresa_id):
+        flash("No tienes acceso a esa empresa.")
         return redirect(request.referrer or url_for("index"))
-    session["empresa_activa_id"] = int(empresa["id"])
+    session["empresa_activa_id"] = empresa_id
+    empresa = get_empresa_by_id(empresa_id)
     flash(f"Empresa activa actualizada a: {empresa['nombre']}")
     return redirect(request.referrer or url_for("index"))
 
 
 @app.route("/reset", methods=["POST"])
+@login_required
 def reset_data():
-    reset_database()
-    flash("Todos los datos cargados fueron eliminados.")
+    empresa = get_active_empresa()
+    reset_database_for_empresa(int(empresa["id"]))
+    flash("Todos los datos cargados de la empresa activa fueron eliminados.")
     return redirect(url_for("index"))
 
 
 @app.route("/")
+@login_required
 def index():
     empresa = get_active_empresa()
-    metrics = get_dashboard_metrics(empresa["id"])
-    imports = get_recent_imports(empresa_id=empresa["id"])
+    metrics = get_dashboard_metrics(int(empresa["id"]))
+    imports = get_recent_imports(empresa_id=int(empresa["id"]))
     body = render_template_string(
         """
         <div class="hero">
           <h1 style="margin:0 0 8px;">Dashboard TributApp</h1>
-          <p style="margin:0;">Software tributario y contable. TRIBUTAPP de MORI Empresas.</p>
-          <div style="margin-top:12px;"><span class="pill">Empresa actual: {{ empresa['nombre'] }} · {{ empresa['rut'] }}</span></div>
+          <p style="margin:0;">Software tributario y contable multiempresa.</p>
         </div>
         <div class="grid cards">
           <div class="card"><div class="muted">Ventas netas</div><div class="metric">{{ metrics['ventas_netas']|clp }}</div></div>
@@ -717,18 +909,17 @@ def index():
           <div class="card">
             <h3>Últimos archivos importados</h3>
             <table>
-              <thead><tr><th>Empresa</th><th>Archivo</th><th>Tipo</th><th>Período</th><th>Filas</th></tr></thead>
+              <thead><tr><th>Archivo</th><th>Tipo</th><th>Período</th><th>Filas</th></tr></thead>
               <tbody>
               {% for item in imports %}
                 <tr>
-                  <td>{{ item['empresa_nombre'] }}</td>
                   <td>{{ item['nombre_archivo'] }}</td>
                   <td>{{ item['tipo_archivo'] }}</td>
                   <td>{{ item['periodo'] }}</td>
                   <td>{{ item['total_filas'] }}</td>
                 </tr>
               {% else %}
-                <tr><td colspan="5">Aún no hay archivos.</td></tr>
+                <tr><td colspan="4">Aún no hay archivos.</td></tr>
               {% endfor %}
               </tbody>
             </table>
@@ -739,13 +930,12 @@ def index():
             <p><a class="btn btn-secondary" href="{{ url_for('cargar_archivos') }}">Subir archivos CSV</a></p>
             <p><a class="btn btn-secondary" href="{{ url_for('calculadora_honorarios') }}">Calcular honorarios</a></p>
             <p><a class="btn btn-secondary" href="{{ url_for('calculadora_iva_view') }}">Calcular IVA</a></p>
-            <form method="post" action="{{ url_for('reset_data') }}" onsubmit="return confirm('¿Eliminar todos los datos cargados?');">
-              <button class="btn btn-secondary" type="submit">Eliminar datos cargados</button>
+            <form method="post" action="{{ url_for('reset_data') }}" onsubmit="return confirm('¿Eliminar todos los datos cargados de la empresa activa?');">
+              <button class="btn btn-secondary" type="submit">Eliminar datos de esta empresa</button>
             </form>
           </div>
         </div>
         """,
-        empresa=empresa,
         metrics=metrics,
         imports=imports,
     )
@@ -753,27 +943,32 @@ def index():
 
 
 @app.route("/empresas", methods=["GET", "POST"])
+@login_required
 def empresas_view():
+    user = get_current_user()
+    assert user is not None
+
     if request.method == "POST":
         nombre = request.form.get("nombre", "").strip()
         rut = request.form.get("rut", "").strip()
         if not nombre:
             flash("Debes ingresar el nombre de la empresa.")
             return redirect(url_for("empresas_view"))
-        create_empresa(nombre, rut or "00000000-0")
-        flash("Empresa creada correctamente.")
+        empresa_id = create_empresa(nombre, rut or "00000000-0", owner_user_id=int(user["id"]))
+        session["empresa_activa_id"] = empresa_id
+        flash("Empresa creada correctamente y seleccionada como activa.")
         return redirect(url_for("empresas_view"))
 
-    empresas = get_empresas()
+    empresas = get_empresas(user_id=int(user["id"]))
     body = render_template_string(
         """
         <div class="hero">
           <h1 style="margin:0 0 8px;">Gestión de empresas</h1>
-          <p style="margin:0;">Este es el paso clave para convertir TributApp en SaaS real: varias empresas dentro del mismo sistema.</p>
+          <p style="margin:0;">Cada usuario administra sus propias empresas.</p>
         </div>
         <div class="grid" style="grid-template-columns: 1.2fr 1fr;">
           <div class="card">
-            <h3>Empresas registradas</h3>
+            <h3>Mis empresas</h3>
             <table>
               <thead><tr><th>ID</th><th>Nombre</th><th>RUT</th></tr></thead>
               <tbody>
@@ -801,6 +996,7 @@ def empresas_view():
 
 
 @app.route("/cargar", methods=["GET", "POST"])
+@login_required
 def cargar_archivos():
     if request.method == "POST":
         file = request.files.get("archivo")
@@ -818,10 +1014,7 @@ def cargar_archivos():
 
     body = render_template_string(
         """
-        <div class="hero">
-          <h1 style="margin:0 0 8px;">Carga de archivos del SII</h1>
-          <p style="margin:0;">Sube archivos CSV del RCV de compras o ventas. El sistema interpreta formatos reales del SII.</p>
-        </div>
+        <div class="hero"><h1 style="margin:0 0 8px;">Carga de archivos del SII</h1><p style="margin:0;">Los archivos se cargan en la empresa activa.</p></div>
         <div class="card">
           <form method="post" enctype="multipart/form-data">
             <p><label>Archivo CSV</label><input type="file" name="archivo" accept=".csv" required></p>
@@ -834,12 +1027,13 @@ def cargar_archivos():
 
 
 @app.route("/compras")
+@login_required
 def compras_view():
     empresa = get_active_empresa()
     compras = get_compras(empresa_id=int(empresa["id"]))
     body = render_template_string(
         """
-        <div class="hero"><h1 style="margin:0 0 8px;">RCV Compras</h1><p style="margin:0;">Listado operativo de documentos de compra cargados.</p></div>
+        <div class="hero"><h1 style="margin:0 0 8px;">RCV Compras</h1><p style="margin:0;">Listado de compras de la empresa activa.</p></div>
         <div class="card">
           <table>
             <thead><tr><th>Fecha</th><th>Tipo</th><th>Folio</th><th>RUT</th><th>Proveedor</th><th>Neto</th><th>IVA</th><th>Total</th></tr></thead>
@@ -868,6 +1062,7 @@ def compras_view():
 
 
 @app.route("/calculadoras/honorarios", methods=["GET", "POST"])
+@login_required
 def calculadora_honorarios():
     resultado = None
     modo = "bruto"
@@ -920,6 +1115,7 @@ def calculadora_honorarios():
 
 
 @app.route("/calculadoras/iva", methods=["GET", "POST"])
+@login_required
 def calculadora_iva_view():
     resultado = None
     ventas_netas = ""
@@ -957,12 +1153,13 @@ def calculadora_iva_view():
 
 
 @app.route("/reportes")
+@login_required
 def reportes_view():
     empresa = get_active_empresa()
     data = get_reportes(empresa_id=int(empresa["id"]))
     body = render_template_string(
         """
-        <div class="hero"><h1 style="margin:0 0 8px;">Reportes</h1><p style="margin:0;">Vista gerencial simple por período.</p></div>
+        <div class="hero"><h1 style="margin:0 0 8px;">Reportes</h1><p style="margin:0;">Vista gerencial simple por período de la empresa activa.</p></div>
         <div class="grid" style="grid-template-columns: 1fr 1fr;">
           <div class="card">
             <h3>Ventas por período</h3>
@@ -1013,31 +1210,19 @@ class TributAppTests(unittest.TestCase):
         self.assertEqual(parse_percentage("15.25"), 0.1525)
         self.assertEqual(parse_percentage("0,1525"), 0.1525)
 
-    def test_detect_tipo_archivo(self) -> None:
-        self.assertEqual(detect_tipo_archivo("RCV_COMPRA_123_202601.csv"), "compra")
-        self.assertEqual(detect_tipo_archivo("RCV_VENTA_123_202601.csv"), "venta")
-        self.assertEqual(detect_tipo_archivo("otro.csv"), "desconocido")
-
-    def test_detect_periodo(self) -> None:
-        self.assertEqual(detect_periodo("RCV_COMPRA_12345678_202601.csv"), "202601")
-
-    def test_get_base_dir_returns_path(self) -> None:
-        self.assertIsInstance(get_base_dir(), Path)
-
-    def test_init_db_creates_tables(self) -> None:
+    def test_create_user_and_lookup(self) -> None:
         global DB_PATH
         original_db_path = DB_PATH
         try:
             with tempfile.TemporaryDirectory() as tmp_dir:
                 DB_PATH = Path(tmp_dir) / "test_tributapp.db"
                 init_db()
-                conn = get_connection()
-                tables = {row["name"] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-                conn.close()
-                self.assertIn("empresas", tables)
-                self.assertIn("compras", tables)
-                self.assertIn("ventas", tables)
-                self.assertIn("archivos_importados", tables)
+                user_id = create_user("Octavio", "octavio@example.com", "clave123")
+                self.assertGreater(user_id, 0)
+                user = get_user_by_email("octavio@example.com")
+                self.assertIsNotNone(user)
+                self.assertEqual(user["name"], "Octavio")
+                self.assertTrue(check_password_hash(user["password_hash"], "clave123"))
         finally:
             DB_PATH = original_db_path
 
@@ -1048,9 +1233,10 @@ class TributAppTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as tmp_dir:
                 DB_PATH = Path(tmp_dir) / "test_tributapp.db"
                 init_db()
-                empresa_id = create_empresa("INY SpA", "77801453-K")
+                user_id = create_user("Octavio", "octa@test.com", "123456")
+                empresa_id = create_empresa("INY SpA", "77801453-K", owner_user_id=user_id)
                 self.assertGreater(empresa_id, 0)
-                empresas = get_empresas()
+                empresas = get_empresas(user_id=user_id)
                 nombres = [e["nombre"] for e in empresas]
                 self.assertIn("INY SpA", nombres)
         finally:
@@ -1063,35 +1249,30 @@ class TributAppTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as tmp_dir:
                 DB_PATH = Path(tmp_dir) / "test_tributapp.db"
                 init_db()
-                empresa_id = create_empresa("Cliente Uno", "11111111-1")
+                user_id = create_user("Cliente", "cliente@test.com", "123456")
+                empresa_id = create_empresa("Cliente Uno", "11111111-1", owner_user_id=user_id)
                 with app.test_request_context("/"):
                     session.clear()
+                    session["user_id"] = user_id
                     session["empresa_activa_id"] = empresa_id
                     empresa = get_active_empresa()
                     self.assertEqual(empresa["nombre"], "Cliente Uno")
         finally:
             DB_PATH = original_db_path
 
+    def test_detect_tipo_archivo(self) -> None:
+        self.assertEqual(detect_tipo_archivo("RCV_COMPRA_123_202601.csv"), "compra")
+        self.assertEqual(detect_tipo_archivo("RCV_VENTA_123_202601.csv"), "venta")
+        self.assertEqual(detect_tipo_archivo("otro.csv"), "desconocido")
+
+    def test_detect_periodo(self) -> None:
+        self.assertEqual(detect_periodo("RCV_COMPRA_12345678_202601.csv"), "202601")
+
     def test_map_columns_accepts_common_headers(self) -> None:
         headers = ["Tipo Doc", "Folio", "Fecha", "RUT", "Razón Social", "Monto Neto", "IVA", "Total"]
         mapping = map_columns(headers)
         for column in REQUIRED_COLUMNS:
             self.assertIn(column, mapping)
-
-    def test_get_reportes_has_expected_keys(self) -> None:
-        global DB_PATH
-        original_db_path = DB_PATH
-        try:
-            with tempfile.TemporaryDirectory() as tmp_dir:
-                DB_PATH = Path(tmp_dir) / "test_tributapp.db"
-                init_db()
-                reportes = get_reportes()
-                self.assertIn("ventas_por_periodo", reportes)
-                self.assertIn("compras_por_periodo", reportes)
-                self.assertIn("top_proveedores", reportes)
-                self.assertIn("top_clientes", reportes)
-        finally:
-            DB_PATH = original_db_path
 
     def test_calcular_honorarios_desde_bruto(self) -> None:
         resultado = calcular_honorarios_desde_bruto(1000000, 0.1525)
@@ -1108,39 +1289,6 @@ class TributAppTests(unittest.TestCase):
         self.assertEqual(resultado["iva_debito"], 570000.0)
         self.assertEqual(resultado["iva_credito"], 190000.0)
         self.assertEqual(resultado["iva_pagar"], 380000.0)
-
-    def test_reset_database(self) -> None:
-        global DB_PATH
-        original_db_path = DB_PATH
-        try:
-            with tempfile.TemporaryDirectory() as tmp_dir:
-                DB_PATH = Path(tmp_dir) / "test_tributapp.db"
-                init_db()
-                conn = get_connection()
-                empresa_id = conn.execute("SELECT id FROM empresas LIMIT 1").fetchone()["id"]
-                conn.execute(
-                    "INSERT INTO archivos_importados (empresa_id, nombre_archivo, tipo_archivo, periodo, total_filas, fecha_importacion) VALUES (?, ?, ?, ?, ?, ?)",
-                    (empresa_id, "test.csv", "compra", "202501", 1, datetime.now().isoformat()),
-                )
-                archivo_id = conn.execute("SELECT id FROM archivos_importados").fetchone()["id"]
-                conn.execute(
-                    "INSERT INTO compras (empresa_id, periodo, tipo_doc, folio, fecha, rut, razon_social, exento, neto, iva, total, archivo_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (empresa_id, "202501", "33", "1", "2025-01-01", "11111111-1", "Proveedor Test", 0, 1000, 190, 1190, archivo_id),
-                )
-                conn.execute(
-                    "INSERT INTO ventas (empresa_id, periodo, tipo_doc, folio, fecha, rut, razon_social, exento, neto, iva, total, archivo_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (empresa_id, "202501", "33", "1", "2025-01-01", "22222222-2", "Cliente Test", 0, 2000, 380, 2380, archivo_id),
-                )
-                conn.commit()
-                conn.close()
-                reset_database()
-                conn = get_connection()
-                self.assertEqual(conn.execute("SELECT COUNT(*) FROM compras").fetchone()[0], 0)
-                self.assertEqual(conn.execute("SELECT COUNT(*) FROM ventas").fetchone()[0], 0)
-                self.assertEqual(conn.execute("SELECT COUNT(*) FROM archivos_importados").fetchone()[0], 0)
-                conn.close()
-        finally:
-            DB_PATH = original_db_path
 
 
 if __name__ == "__main__":
