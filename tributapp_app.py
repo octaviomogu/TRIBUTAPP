@@ -11,7 +11,7 @@ from functools import wraps
 from pathlib import Path
 from typing import Any
 
-from flask import Flask, flash, redirect, render_template_string, request, session, url_for
+from flask import Flask, flash, make_response, redirect, render_template_string, request, session, url_for
 from werkzeug.security import check_password_hash, generate_password_hash
 
 
@@ -544,6 +544,27 @@ def calcular_iva(ventas_netas: float, compras_netas: float, tasa: float = 0.19) 
     return {"iva_debito": iva_debito, "iva_credito": iva_credito, "iva_pagar": iva_pagar}
 
 
+
+def calcular_f29_resumen(
+    ventas_netas: float,
+    compras_netas: float,
+    ppm_rate: float = 0.0,
+    retenciones_honorarios: float = 0.0,
+    otros_impuestos: float = 0.0,
+) -> dict[str, float]:
+    iva = calcular_iva(ventas_netas, compras_netas)
+    ppm = round(ventas_netas * ppm_rate, 2)
+    subtotal = round(iva["iva_pagar"] + ppm + retenciones_honorarios + otros_impuestos, 2)
+    return {
+        "codigo_538_iva_debito": iva["iva_debito"],
+        "codigo_511_iva_credito": iva["iva_credito"],
+        "codigo_089_ppm": ppm,
+        "codigo_151_ret_honorarios": round(retenciones_honorarios, 2),
+        "otros_impuestos": round(otros_impuestos, 2),
+        "total_estimado_pagar": subtotal,
+    }
+
+
 # -----------------------------
 # Query helpers
 # -----------------------------
@@ -649,6 +670,134 @@ def get_reportes(empresa_id: int | None = None) -> dict[str, Any]:
     }
 
 
+
+def get_balance_general(empresa_id: int) -> dict[str, float]:
+    conn = get_connection()
+    ventas_total = conn.execute(
+        "SELECT COALESCE(SUM(total), 0) AS total FROM ventas WHERE empresa_id = ?",
+        (empresa_id,),
+    ).fetchone()["total"]
+    compras_total = conn.execute(
+        "SELECT COALESCE(SUM(total), 0) AS total FROM compras WHERE empresa_id = ?",
+        (empresa_id,),
+    ).fetchone()["total"]
+    iva_debito = conn.execute(
+        "SELECT COALESCE(SUM(iva), 0) AS total FROM ventas WHERE empresa_id = ?",
+        (empresa_id,),
+    ).fetchone()["total"]
+    iva_credito = conn.execute(
+        "SELECT COALESCE(SUM(iva), 0) AS total FROM compras WHERE empresa_id = ?",
+        (empresa_id,),
+    ).fetchone()["total"]
+    conn.close()
+
+    caja_bancos = round(float(ventas_total) - float(compras_total), 2)
+    iva_por_pagar = round(float(iva_debito) - float(iva_credito), 2)
+    activos = round(caja_bancos + max(float(iva_credito) - float(iva_debito), 0), 2)
+    pasivos = round(max(iva_por_pagar, 0), 2)
+    patrimonio = round(activos - pasivos, 2)
+
+    return {
+        "caja_bancos": caja_bancos,
+        "iva_debito": float(iva_debito),
+        "iva_credito": float(iva_credito),
+        "iva_por_pagar": iva_por_pagar,
+        "activos": activos,
+        "pasivos": pasivos,
+        "patrimonio": patrimonio,
+    }
+
+
+
+def generate_report_csv_content(reportes: dict[str, Any]) -> str:
+    output = io.StringIO()
+    writer = csv.writer(output, delimiter=';')
+
+    writer.writerow(["VENTAS POR PERIODO"])
+    writer.writerow(["periodo", "neto", "iva", "total"])
+    for row in reportes["ventas_por_periodo"]:
+        writer.writerow([row["periodo"], row["neto"], row["iva"], row["total"]])
+    writer.writerow([])
+
+    writer.writerow(["COMPRAS POR PERIODO"])
+    writer.writerow(["periodo", "neto", "iva", "total"])
+    for row in reportes["compras_por_periodo"]:
+        writer.writerow([row["periodo"], row["neto"], row["iva"], row["total"]])
+    writer.writerow([])
+
+    writer.writerow(["TOP PROVEEDORES"])
+    writer.writerow(["razon_social", "total"])
+    for row in reportes["top_proveedores"]:
+        writer.writerow([row["razon_social"], row["total"]])
+    writer.writerow([])
+
+    writer.writerow(["TOP CLIENTES"])
+    writer.writerow(["razon_social", "total"])
+    for row in reportes["top_clientes"]:
+        writer.writerow([row["razon_social"], row["total"]])
+
+    return output.getvalue()
+
+
+
+def generate_balance_csv_content(balance: dict[str, float]) -> str:
+    output = io.StringIO()
+    writer = csv.writer(output, delimiter=';')
+    writer.writerow(["BALANCE GENERAL"])
+    writer.writerow(["concepto", "monto"])
+    for key, value in balance.items():
+        writer.writerow([key, value])
+    return output.getvalue()
+
+
+
+def get_periodos_empresa(empresa_id: int) -> list[str]:
+    conn = get_connection()
+    rows = conn.execute(
+        """
+        SELECT periodo FROM (
+            SELECT periodo FROM ventas WHERE empresa_id = ?
+            UNION
+            SELECT periodo FROM compras WHERE empresa_id = ?
+        ) t
+        WHERE periodo IS NOT NULL AND periodo <> ''
+        ORDER BY periodo DESC
+        """,
+        (empresa_id, empresa_id),
+    ).fetchall()
+    conn.close()
+    return [row["periodo"] for row in rows]
+
+
+
+def get_resumen_periodo_empresa(empresa_id: int, periodo: str) -> dict[str, float]:
+    conn = get_connection()
+    ventas_netas = conn.execute(
+        "SELECT COALESCE(SUM(neto), 0) AS total FROM ventas WHERE empresa_id = ? AND periodo = ?",
+        (empresa_id, periodo),
+    ).fetchone()["total"]
+    compras_netas = conn.execute(
+        "SELECT COALESCE(SUM(neto), 0) AS total FROM compras WHERE empresa_id = ? AND periodo = ?",
+        (empresa_id, periodo),
+    ).fetchone()["total"]
+    iva_debito = conn.execute(
+        "SELECT COALESCE(SUM(iva), 0) AS total FROM ventas WHERE empresa_id = ? AND periodo = ?",
+        (empresa_id, periodo),
+    ).fetchone()["total"]
+    iva_credito = conn.execute(
+        "SELECT COALESCE(SUM(iva), 0) AS total FROM compras WHERE empresa_id = ? AND periodo = ?",
+        (empresa_id, periodo),
+    ).fetchone()["total"]
+    conn.close()
+    return {
+        "ventas_netas": float(ventas_netas),
+        "compras_netas": float(compras_netas),
+        "iva_debito": float(iva_debito),
+        "iva_credito": float(iva_credito),
+        "iva_pagar": float(round(iva_debito - iva_credito, 2)),
+    }
+
+
 # -----------------------------
 # Data helpers
 # -----------------------------
@@ -729,10 +878,13 @@ BASE_HTML = """
       <a href="{{ url_for('reportes_view') }}">Reportes</a>
       <a href="{{ url_for('calculadora_honorarios') }}">Honorarios</a>
       <a href="{{ url_for('calculadora_iva_view') }}">IVA</a>
+      <a href="{{ url_for('f29_view') }}">F29</a>
       <a href="{{ url_for('logout_view') }}">Salir</a>
       {% else %}
       <a href="{{ url_for('login_view') }}">Ingresar</a>
       <a href="{{ url_for('register_view') }}">Crear cuenta</a>
+      <a href="{{ url_for('calculadora_honorarios') }}">Honorarios</a>
+      <a href="{{ url_for('calculadora_iva_view') }}">IVA</a>
       {% endif %}
     </div>
   </div>
@@ -887,8 +1039,109 @@ def reset_data():
 
 
 @app.route("/")
-@login_required
 def index():
+    current_user = get_current_user()
+    if current_user is None:
+        body = render_template_string(
+            """
+            <div class="hero">
+              <div style="display:grid; grid-template-columns: 1.25fr 0.95fr; gap:24px; align-items:center;">
+                <div>
+                  <div class="pill" style="background:rgba(255,255,255,.14); color:white;">Hecho para Chile · IVA, Honorarios, F29 y RCV</div>
+                  <h1 style="margin:14px 0 10px; font-size:42px; line-height:1.05;">El software tributario chileno que convierte cálculos gratis en gestión real.</h1>
+                  <p style="margin:0; font-size:18px; max-width:720px; color:rgba(255,255,255,.92);">Usa gratis las calculadoras de IVA y boletas de honorarios, y cuando estés listo da el salto a una plataforma con empresas, usuarios, RCV del SII y F29 automático.</p>
+                  <div style="margin-top:20px; display:flex; gap:12px; flex-wrap:wrap;">
+                    <a class="btn" href="{{ url_for('register_view') }}" style="background:white; color:#0b1320; font-weight:bold;">Crear cuenta gratis</a>
+                    <a class="btn btn-secondary" href="{{ url_for('login_view') }}" style="background:rgba(255,255,255,.14); color:white; border:1px solid rgba(255,255,255,.18);">Ingresar</a>
+                  </div>
+                  <div style="margin-top:18px; display:flex; gap:18px; flex-wrap:wrap; color:rgba(255,255,255,.92); font-size:14px;">
+                    <span>✔ Calculadoras gratuitas</span>
+                    <span>✔ Multiempresa</span>
+                    <span>✔ F29 operativo</span>
+                  </div>
+                </div>
+                <div class="card" style="margin:0; background:rgba(255,255,255,.97);">
+                  <div class="muted">Vista rápida</div>
+                  <h3 style="margin:8px 0 14px;">Lo que TributApp ya resuelve</h3>
+                  <div class="grid cards" style="grid-template-columns:1fr 1fr; gap:12px;">
+                    <div style="padding:14px; border:1px solid #dbe3ea; border-radius:14px;">
+                      <div class="muted">RCV</div>
+                      <div style="font-size:22px; font-weight:bold;">Compras y ventas</div>
+                    </div>
+                    <div style="padding:14px; border:1px solid #dbe3ea; border-radius:14px;">
+                      <div class="muted">F29</div>
+                      <div style="font-size:22px; font-weight:bold;">Estimación mensual</div>
+                    </div>
+                    <div style="padding:14px; border:1px solid #dbe3ea; border-radius:14px;">
+                      <div class="muted">Usuarios</div>
+                      <div style="font-size:22px; font-weight:bold;">Acceso privado</div>
+                    </div>
+                    <div style="padding:14px; border:1px solid #dbe3ea; border-radius:14px;">
+                      <div class="muted">Empresas</div>
+                      <div style="font-size:22px; font-weight:bold;">Múltiples clientes</div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="grid cards" style="margin-top: 4px;">
+              <div class="card" style="position:relative; overflow:hidden;">
+                <div class="muted">Herramienta gratuita</div>
+                <h3 style="margin:8px 0;">Calculadora de Honorarios</h3>
+                <p>Calcula bruto, retención y líquido con una interfaz simple, útil y lista para atraer tráfico orgánico.</p>
+                <p style="margin:14px 0 0;"><a class="btn" href="{{ url_for('calculadora_honorarios') }}">Usar calculadora</a></p>
+              </div>
+              <div class="card" style="position:relative; overflow:hidden;">
+                <div class="muted">Herramienta gratuita</div>
+                <h3 style="margin:8px 0;">Calculadora IVA</h3>
+                <p>Obtén IVA débito, crédito e IVA estimado a pagar en segundos. Ideal para captar visitas con intención real.</p>
+                <p style="margin:14px 0 0;"><a class="btn" href="{{ url_for('calculadora_iva_view') }}">Usar calculadora</a></p>
+              </div>
+              <div class="card" style="position:relative; overflow:hidden;">
+                <div class="muted">Próximo gran módulo</div>
+                <h3 style="margin:8px 0;">F29 Automático</h3>
+                <p>Convierte tus libros y RCV en una estimación operativa del F29 para cada período y empresa.</p>
+                <p style="margin:14px 0 0;"><a class="btn btn-secondary" href="{{ url_for('register_view') }}">Crear cuenta para usarlo</a></p>
+              </div>
+            </div>
+
+            <div class="grid" style="grid-template-columns: 1.15fr 0.85fr; margin-top:16px;">
+              <div class="card">
+                <h3 style="margin-top:0;">Por qué TributApp puede ganar espacio en Chile</h3>
+                <div class="grid" style="grid-template-columns:1fr 1fr; gap:14px; margin-top:14px;">
+                  <div>
+                    <div class="pill">Atracción</div>
+                    <p style="margin:10px 0 0;">Calculadoras públicas para captar búsquedas de alto valor.</p>
+                  </div>
+                  <div>
+                    <div class="pill">Conversión</div>
+                    <p style="margin:10px 0 0;">De herramienta gratuita a cuenta creada en pocos clics.</p>
+                  </div>
+                  <div>
+                    <div class="pill">Operación</div>
+                    <p style="margin:10px 0 0;">RCV, empresas, usuarios y panel privado en una sola app.</p>
+                  </div>
+                  <div>
+                    <div class="pill">Especialización</div>
+                    <p style="margin:10px 0 0;">Enfoque tributario chileno: F29 hoy, F22 después.</p>
+                  </div>
+                </div>
+              </div>
+              <div class="card">
+                <h3 style="margin-top:0;">Empieza ahora</h3>
+                <p class="muted">Prueba gratis las calculadoras y luego entra al flujo completo.</p>
+                <div style="display:grid; gap:10px; margin-top:16px;">
+                  <a class="btn" href="{{ url_for('calculadora_honorarios') }}">Probar Honorarios</a>
+                  <a class="btn btn-secondary" href="{{ url_for('calculadora_iva_view') }}">Probar IVA</a>
+                  <a class="btn btn-secondary" href="{{ url_for('register_view') }}">Crear cuenta gratis</a>
+                </div>
+              </div>
+            </div>
+            """
+        )
+        return render_template_string(BASE_HTML, title="TributApp", body=body)
+
     empresa = get_active_empresa()
     metrics = get_dashboard_metrics(int(empresa["id"]))
     imports = get_recent_imports(empresa_id=int(empresa["id"]))
@@ -1062,7 +1315,6 @@ def compras_view():
 
 
 @app.route("/calculadoras/honorarios", methods=["GET", "POST"])
-@login_required
 def calculadora_honorarios():
     resultado = None
     modo = "bruto"
@@ -1115,7 +1367,6 @@ def calculadora_honorarios():
 
 
 @app.route("/calculadoras/iva", methods=["GET", "POST"])
-@login_required
 def calculadora_iva_view():
     resultado = None
     ventas_netas = ""
@@ -1152,6 +1403,128 @@ def calculadora_iva_view():
     return render_template_string(BASE_HTML, title="Calculadora IVA", body=body)
 
 
+@app.route("/f29", methods=["GET", "POST"])
+@login_required
+def f29_view():
+    empresa = get_active_empresa()
+    periodos = get_periodos_empresa(int(empresa["id"]))
+    periodo = request.form.get("periodo") if request.method == "POST" else (periodos[0] if periodos else "")
+    ppm_porcentaje = request.form.get("ppm_porcentaje", "0") if request.method == "POST" else "0"
+    ret_honorarios = request.form.get("ret_honorarios", "0") if request.method == "POST" else "0"
+    otros_impuestos = request.form.get("otros_impuestos", "0") if request.method == "POST" else "0"
+
+    resumen_periodo = None
+    resumen_f29 = None
+
+    if periodo:
+        resumen_periodo = get_resumen_periodo_empresa(int(empresa["id"]), periodo)
+        ppm_rate = parse_percentage(ppm_porcentaje)
+        resumen_f29 = calcular_f29_resumen(
+            ventas_netas=resumen_periodo["ventas_netas"],
+            compras_netas=resumen_periodo["compras_netas"],
+            ppm_rate=ppm_rate,
+            retenciones_honorarios=parse_decimal(ret_honorarios),
+            otros_impuestos=parse_decimal(otros_impuestos),
+        )
+
+    body = render_template_string(
+        """
+        <div class="hero">
+          <h1 style="margin:0 0 8px;">F29 Automático</h1>
+          <p style="margin:0;">TributApp estima el F29 de la empresa activa desde compras y ventas cargadas del período seleccionado.</p>
+        </div>
+        <div class="card">
+          <form method="post">
+            <div class="form-row">
+              <div>
+                <label>Período</label>
+                <select name="periodo">
+                  {% for p in periodos %}
+                  <option value="{{ p }}" {% if p == periodo %}selected{% endif %}>{{ p }}</option>
+                  {% endfor %}
+                </select>
+              </div>
+              <div>
+                <label>PPM (%)</label>
+                <input type="text" name="ppm_porcentaje" value="{{ ppm_porcentaje }}" placeholder="Ejemplo: 0,25">
+              </div>
+            </div>
+            <div class="form-row" style="margin-top:12px;">
+              <div>
+                <label>Retenciones honorarios</label>
+                <input type="text" name="ret_honorarios" value="{{ ret_honorarios }}" placeholder="Ejemplo: 152500">
+              </div>
+              <div>
+                <label>Otros impuestos / ajustes</label>
+                <input type="text" name="otros_impuestos" value="{{ otros_impuestos }}" placeholder="Ejemplo: 0">
+              </div>
+            </div>
+            <p style="margin-top:14px;"><button class="btn" type="submit">Calcular F29</button></p>
+          </form>
+        </div>
+
+        {% if resumen_periodo and resumen_f29 %}
+        <div class="grid cards">
+          <div class="card"><div class="muted">Ventas netas período</div><div class="metric">{{ resumen_periodo['ventas_netas']|clp }}</div></div>
+          <div class="card"><div class="muted">Compras netas período</div><div class="metric">{{ resumen_periodo['compras_netas']|clp }}</div></div>
+          <div class="card"><div class="muted">IVA débito</div><div class="metric">{{ resumen_f29['codigo_538_iva_debito']|clp }}</div></div>
+          <div class="card"><div class="muted">IVA crédito</div><div class="metric">{{ resumen_f29['codigo_511_iva_credito']|clp }}</div></div>
+        </div>
+
+        <div class="card">
+          <h3>Resumen F29 estimado</h3>
+          <table>
+            <thead><tr><th>Código</th><th>Concepto</th><th>Monto</th></tr></thead>
+            <tbody>
+              <tr><td>538</td><td>IVA débito fiscal</td><td>{{ resumen_f29['codigo_538_iva_debito']|clp }}</td></tr>
+              <tr><td>511</td><td>IVA crédito fiscal</td><td>{{ resumen_f29['codigo_511_iva_credito']|clp }}</td></tr>
+              <tr><td>089</td><td>PPM</td><td>{{ resumen_f29['codigo_089_ppm']|clp }}</td></tr>
+              <tr><td>151</td><td>Retenciones honorarios</td><td>{{ resumen_f29['codigo_151_ret_honorarios']|clp }}</td></tr>
+              <tr><td>-</td><td>Otros impuestos / ajustes</td><td>{{ resumen_f29['otros_impuestos']|clp }}</td></tr>
+              <tr><td><strong>Total</strong></td><td><strong>Total estimado a pagar</strong></td><td><strong>{{ resumen_f29['total_estimado_pagar']|clp }}</strong></td></tr>
+            </tbody>
+          </table>
+          <p class="muted" style="margin-top:12px;">Este módulo entrega una estimación operativa del F29 con base en los datos cargados. Los códigos adicionales dependen del régimen tributario y otras variables no capturadas todavía por el sistema.</p>
+        </div>
+        {% elif not periodos %}
+        <div class="card"><p class="muted">Aún no hay períodos disponibles. Primero carga compras y ventas del SII para calcular el F29.</p></div>
+        {% endif %}
+        """,
+        periodos=periodos,
+        periodo=periodo,
+        ppm_porcentaje=ppm_porcentaje,
+        ret_honorarios=ret_honorarios,
+        otros_impuestos=otros_impuestos,
+        resumen_periodo=resumen_periodo,
+        resumen_f29=resumen_f29,
+    )
+    return render_template_string(BASE_HTML, title="F29", body=body)
+
+
+@app.route("/descargar/reportes")
+@login_required
+def descargar_reportes_view():
+    empresa = get_active_empresa()
+    reportes = get_reportes(empresa_id=int(empresa["id"]))
+    content = generate_report_csv_content(reportes)
+    response = make_response(content)
+    response.headers["Content-Type"] = "text/csv; charset=utf-8"
+    response.headers["Content-Disposition"] = f"attachment; filename=reportes_{empresa['nombre'].replace(' ', '_')}.csv"
+    return response
+
+
+@app.route("/descargar/balance")
+@login_required
+def descargar_balance_view():
+    empresa = get_active_empresa()
+    balance = get_balance_general(int(empresa["id"]))
+    content = generate_balance_csv_content(balance)
+    response = make_response(content)
+    response.headers["Content-Type"] = "text/csv; charset=utf-8"
+    response.headers["Content-Disposition"] = f"attachment; filename=balance_{empresa['nombre'].replace(' ', '_')}.csv"
+    return response
+
+
 @app.route("/reportes")
 @login_required
 def reportes_view():
@@ -1159,7 +1532,7 @@ def reportes_view():
     data = get_reportes(empresa_id=int(empresa["id"]))
     body = render_template_string(
         """
-        <div class="hero"><h1 style="margin:0 0 8px;">Reportes</h1><p style="margin:0;">Vista gerencial simple por período de la empresa activa.</p></div>
+        <div class="hero"><h1 style="margin:0 0 8px;">Reportes</h1><p style="margin:0;">Vista gerencial simple por período de la empresa activa.</p><p style="margin-top:14px; display:flex; gap:10px; flex-wrap:wrap;"><a class="btn" href="{{ url_for('descargar_reportes_view') }}">Descargar reportes CSV</a><a class="btn btn-secondary" href="{{ url_for('descargar_balance_view') }}">Descargar balance CSV</a></p></div>
         <div class="grid" style="grid-template-columns: 1fr 1fr;">
           <div class="card">
             <h3>Ventas por período</h3>
@@ -1290,9 +1663,42 @@ class TributAppTests(unittest.TestCase):
         self.assertEqual(resultado["iva_credito"], 190000.0)
         self.assertEqual(resultado["iva_pagar"], 380000.0)
 
+    def test_calcular_f29_resumen(self) -> None:
+        resultado = calcular_f29_resumen(
+            ventas_netas=3000000,
+            compras_netas=1000000,
+            ppm_rate=0.0025,
+            retenciones_honorarios=50000,
+            otros_impuestos=10000,
+        )
+        self.assertEqual(resultado["codigo_538_iva_debito"], 570000.0)
+        self.assertEqual(resultado["codigo_511_iva_credito"], 190000.0)
+        self.assertEqual(resultado["codigo_089_ppm"], 7500.0)
+        self.assertEqual(resultado["codigo_151_ret_honorarios"], 50000.0)
+        self.assertEqual(resultado["total_estimado_pagar"], 447500.0)
+
+    def test_get_balance_general_structure(self) -> None:
+        global DB_PATH
+        original_db_path = DB_PATH
+        try:
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                DB_PATH = Path(tmp_dir) / "test_tributapp.db"
+                init_db()
+                user_id = create_user("Octavio", "oct@test.com", "123456")
+                empresa_id = create_empresa("INY SpA", "77801453-K", owner_user_id=user_id)
+                balance = get_balance_general(empresa_id)
+                self.assertIn("activos", balance)
+                self.assertIn("pasivos", balance)
+                self.assertIn("patrimonio", balance)
+        finally:
+            DB_PATH = original_db_path
+
+
+# Inicializar base también cuando Gunicorn importa el módulo en producción
+init_db()
+
 
 if __name__ == "__main__":
-    init_db()
     if "--test" in sys.argv:
         unittest.main(argv=[sys.argv[0]])
     elif "--runserver" in sys.argv:
