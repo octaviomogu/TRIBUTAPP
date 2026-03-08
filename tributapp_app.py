@@ -1248,9 +1248,9 @@ def index():
             <div class="hero">
               <div style="display:grid; grid-template-columns: 1.25fr 0.95fr; gap:24px; align-items:center;">
                 <div>
-                  <div class="pill" style="background:rgba(255,255,255,.14); color:white;">Hecho para Chile · IVA, Honorarios, F29 y RCV</div>
+                  <div class="pill" style="background:rgba(255,255,255,.14); color:white;">Hecho para Chile · IVA, Honorarios, F29, F22 y RCV</div>
                   <h1 style="margin:14px 0 10px; font-size:42px; line-height:1.05;">El software tributario chileno que convierte cálculos gratis en gestión real.</h1>
-                  <p style="margin:0; font-size:18px; max-width:720px; color:rgba(255,255,255,.92);">Usa gratis las calculadoras de IVA y boletas de honorarios, y cuando estés listo da el salto a una plataforma con empresas, usuarios, RCV del SII y F29 automático.</p>
+                  <p style="margin:0; font-size:18px; max-width:720px; color:rgba(255,255,255,.92);">Usa gratis las calculadoras de IVA y boletas de honorarios, y cuando estés listo da el salto a una plataforma con empresas, usuarios, RCV del SII, F29 automático y proyección de F22 anual para personas y empresas.</p>
                   <div style="margin-top:20px; display:flex; gap:12px; flex-wrap:wrap;">
                     <a class="btn" href="{{ url_for('register_view') }}" style="background:white; color:#0b1320; font-weight:bold;">Crear cuenta gratis</a>
                     <a class="btn btn-secondary" href="{{ url_for('login_view') }}" style="background:rgba(255,255,255,.14); color:white; border:1px solid rgba(255,255,255,.18);">Ingresar</a>
@@ -1259,6 +1259,7 @@ def index():
                     <span>✔ Calculadoras gratuitas</span>
                     <span>✔ Multiempresa</span>
                     <span>✔ F29 operativo</span>
+                    <span>✔ F22 proyectado</span>
                   </div>
                 </div>
                 <div class="card" style="margin:0; background:rgba(255,255,255,.97);">
@@ -1272,6 +1273,11 @@ def index():
                     <div style="padding:14px; border:1px solid #dbe3ea; border-radius:14px;">
                       <div class="muted">F29</div>
                       <div style="font-size:22px; font-weight:bold;">Estimación mensual</div>
+                    </div>
+                    <div style="padding:14px; border:1px solid #dbe3ea; border-radius:14px;">
+                      <div style="padding:14px; border:1px solid #dbe3ea; border-radius:14px;">
+                      <div class="muted">F22</div>
+                      <div style="font-size:22px; font-weight:bold;">Proyección anual</div>
                     </div>
                     <div style="padding:14px; border:1px solid #dbe3ea; border-radius:14px;">
                       <div class="muted">Usuarios</div>
@@ -1300,9 +1306,9 @@ def index():
                 <p style="margin:14px 0 0;"><a class="btn" href="{{ url_for('calculadora_iva_view') }}">Usar calculadora</a></p>
               </div>
               <div class="card" style="position:relative; overflow:hidden;">
-                <div class="muted">Próximo gran módulo</div>
-                <h3 style="margin:8px 0;">F29 Automático</h3>
-                <p>Convierte tus libros y RCV en una estimación operativa del F29 para cada período y empresa.</p>
+                <div class="muted">Módulo tributario</div>
+                <h3 style="margin:8px 0;">F29 y F22</h3>
+                <p>Convierte tus libros y RCV en una estimación operativa del F29 mensual y una proyección anual de F22 para personas y empresas.</p>
                 <p style="margin:14px 0 0;"><a class="btn btn-secondary" href="{{ url_for('register_view') }}">Crear cuenta para usarlo</a></p>
               </div>
             </div>
@@ -1325,7 +1331,7 @@ def index():
                   </div>
                   <div>
                     <div class="pill">Especialización</div>
-                    <p style="margin:10px 0 0;">Enfoque tributario chileno: F29 hoy, F22 después.</p>
+                    <p style="margin:10px 0 0;">Enfoque tributario chileno: F29 mensual y F22 anual en una sola plataforma.</p>
                   </div>
                 </div>
               </div>
